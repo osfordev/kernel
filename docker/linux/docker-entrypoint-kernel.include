@@ -1,0 +1,142 @@
+function export_builtin_variables() {
+	if [ ! -f /DOCKER_ARCH ]; then
+		echo "Look like you have wrong build container. The container should present a file /DOCKER_ARCH"
+		exit 1
+	fi
+	DOCKER_ARCH=$(cat /DOCKER_ARCH)
+	if [ -z "${DOCKER_ARCH}" ]; then
+		echo "Look like you have wrong build container. The container should present a file /DOCKER_ARCH with proper arch value."
+		exit 1
+	fi
+
+	if [ ! -f /KERNEL_VERSION ]; then
+		echo "Look like you have wrong build container. The container should present a file /KERNEL_VERSION"
+		exit 1
+	fi
+	KERNEL_VERSION=$(cat /KERNEL_VERSION)
+	if [ -z "${KERNEL_VERSION}" ]; then
+		echo "Look like you have wrong build container. The container should present a file /KERNEL_VERSION with proper kernel version."
+		exit 1
+	fi
+}
+
+function configure_kbuild_output() {
+	if [ -z "${KERNEL_SLUG}" ]; then
+		echo "Required KERNEL_SLUG variable is not set before call configure_kbuild_output()" >2
+		exit 1
+	fi
+
+	export KBUILD_OUTPUT="/data/cache/usr/src/linux-${KERNEL_SLUG}"
+
+	if [ ! -d "${KBUILD_OUTPUT}" ]; then
+		echo "Creating directory ${KBUILD_OUTPUT}..."
+		mkdir --parents "${KBUILD_OUTPUT}"
+	fi
+}
+
+function configure_init_userconfig_from_siteconfig() {
+	if [ -z "${KERNEL_SLUG}" ]; then
+		echo "Required KERNEL_SLUG variable is not set before call configure_init_userconfig_from_siteconfig()" >2
+		exit 1
+	fi
+
+	if [ ! -f "/data/build/.config" ]; then
+		if [ -n "${SITE}" ]; then
+			echo "Using SITE: ${SITE}"
+			SITE_KERNEL_CONFIG_FILE="/support/sites/config-${KERNEL_SLUG}-${SITE}"
+			if [ -f "${SITE_KERNEL_CONFIG_FILE}" ]; then
+				echo "Initialize kernel configuration from ${SITE_KERNEL_CONFIG_FILE} ..."
+				cp "${SITE_KERNEL_CONFIG_FILE}" "/data/build/.config"
+			else
+				echo "Cannot initialize user's kernel configuration due a file ${SITE_KERNEL_CONFIG_FILE} not found."
+			fi
+		else
+			echo "Skip config initialization due SITE variable is not set."
+		fi
+	fi
+}
+
+function configure_kernel() {
+	if [ -z "${KERNEL_SLUG}" ]; then
+		echo "Required KERNEL_SLUG variable is not set before call configure_kernel()" >2
+		exit 1
+	fi
+
+	configure_kbuild_output
+
+	configure_init_userconfig_from_siteconfig
+
+	if [ -f "/data/build/.config" ]; then
+		# Sync user's configuration
+		cp --verbose "/data/build/.config" "${KBUILD_OUTPUT}/.config"
+	fi
+
+	make menuconfig
+	
+	# Save user's configuration
+	cp --verbose "${KBUILD_OUTPUT}/.config" "/data/build/.config"
+}
+
+function build_kernel() {
+	if [ -z "${KERNEL_SLUG}" ]; then
+		echo "Required KERNEL_SLUG variable is not set before call build_kernel()" >2
+		exit 1
+	fi
+
+	if [ -z "${DOCKER_ARCH}" ]; then
+		echo "Required DOCKER_ARCH variable is not set before call build_kernel()" >2
+		exit 1
+	fi
+
+	configure_kbuild_output
+
+	configure_init_userconfig_from_siteconfig
+
+	if [ ! -f "/data/build/.config" ]; then
+		echo "There no config file '/data/build/.config'. Cannot continue. Try use use correct SITE environment variable or place file yourself." >&2
+		exit 6
+	fi
+
+	LOCALVERSION=$(grep 'CONFIG_LOCALVERSION=' "/data/build/.config" | sed 's/CONFIG_LOCALVERSION=//g' | sed -e 's/^"//g' | sed -e 's/"$//g')
+	if [ -z "${LOCALVERSION}" ]; then
+		echo "Cannot get LOCALVERSION from '/data/build/.config'" >&2
+		exit 12
+	fi
+	KERNEL_FULL_NAME="${KERNEL_SLUG}${LOCALVERSION}"
+
+	if [ -f "/data/build/.config" ]; then
+		# Sync user's configuration
+		cp --verbose  /data/build/.config "${KBUILD_OUTPUT}/.config"
+	fi
+
+	make "-j$(nproc)"
+
+	cp --verbose "${KBUILD_OUTPUT}/System.map"                       "/data/build/System.map-${KERNEL_FULL_NAME}"
+	cp --verbose "${KBUILD_OUTPUT}/.config"                          "/data/build/config-${KERNEL_FULL_NAME}"
+	case "${DOCKER_ARCH}" in
+		linux/amd64)
+			cp --verbose "${KBUILD_OUTPUT}/arch/x86_64/boot/bzImage" "/data/build/vmlinuz-${KERNEL_FULL_NAME}"
+			;;
+		linux/386)
+			cp --verbose "${KBUILD_OUTPUT}/arch/x86/boot/bzImage" "/data/build/vmlinuz-${KERNEL_FULL_NAME}"
+			;;
+		linux/arm64/v8)
+			cp --verbose "${KBUILD_OUTPUT}/arch/arm64/boot/Image" "/data/build/vmlinuz-${KERNEL_FULL_NAME}"
+			;;
+		*)
+			cp --verbose "${KBUILD_OUTPUT}/arch/x86/boot/bzImage" "/data/build/vmlinuz-${KERNEL_FULL_NAME}"
+			;;
+	esac
+
+	if grep 'CONFIG_MODULES=y' "/data/build/.config" >/dev/null 2>&1; then
+		INSTALL_MOD_PATH=/data/cache make modules_install
+
+		if [ -L "/data/cache/lib/modules/${KERNEL_FULL_NAME}/build" ]; then
+			rm "/data/cache/lib/modules/${KERNEL_FULL_NAME}/build"	
+		fi
+		if [ -L "/data/cache/lib/modules/${KERNEL_FULL_NAME}/source" ]; then
+			rm "/data/cache/lib/modules/${KERNEL_FULL_NAME}/source"	
+		fi
+		(cd /data/cache && tar --create --gzip --preserve-permissions --file="/data/build/modules-${KERNEL_FULL_NAME}.tar.gz" lib/modules)
+	fi
+}
